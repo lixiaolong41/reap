@@ -75,20 +75,19 @@ class DatasetArgs:
     dataset_name: str = field(
         default="theblackcat102/evol-codealpaca-v1",
         metadata={
-            "help": "Name of the dataset to use.",
-            "choices": [
-                "m-a-p/CodeFeedback-Filtered-Instruction",
-                "ise-uiuc/Magicoder-Evol-Instruct-110K",
-                "allenai/c4",
-                "theblackcat102/evol-codealpaca-v1",
-                "euclaise/WritingPrompts_curated",
-                "allenai/tulu-3-sft-personas-math",
-                "combined"
-            ],
+            "help": (
+                "Name of the dataset to use. Can be a single HuggingFace dataset name "
+                "(e.g., 'theblackcat102/evol-codealpaca-v1') or a composite specification "
+                "with comma-separated entries of <dataset>[<subset>](<split>):<num_samples>. "
+                "Example: 'theblackcat102/evol-codealpaca-v1:4096,"
+                "open-r1/Mixture-of-Thoughts[code]:4096,"
+                "SWE-bench/SWE-smith-trajectories(tool):4096'. "
+                "Use 'combined' to load pre-recorded combined observation data."
+            ),            
         },
     )
     dataset_config_name: str = field(
-        default="all", metadata={"help": "Configuration name of the dataset."}
+        default=None, metadata={"help": "Configuration name of the dataset."}
     )
     split: str = field(default="train", metadata={"help": "Dataset split to use."})
     shuffle: bool = field(
@@ -111,6 +110,7 @@ class ObserverArgs:
             )
         },
     )
+    batch_size: int = 1
     model_max_length: int | None = 2048
     return_vllm_tokens_prompt: bool = False
     truncate: bool = False

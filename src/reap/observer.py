@@ -411,13 +411,17 @@ class MoETransformerObserver(BaseTransformerObserver):
                     _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                     selected_experts = selected_experts.to(device)
 
+                    # Re-allocate activations on CPU to avoid GPU OOM with large expert
+                    # counts (e.g., 256 experts). Each expert's output is computed on GPU
+                    # then immediately moved to CPU.
+                    activations = torch.zeros((num_experts, *flat_input.shape), device="cpu")
                     experts = module.experts
                     act_fn = experts.act_fn
                     for idx in range(num_experts):
                         gate_up = F.linear(flat_input, experts.gate_up_proj[idx])
                         gate, up = gate_up.chunk(2, dim=-1)
                         hidden = act_fn(gate) * up
-                        activations[idx] = F.linear(hidden, experts.down_proj[idx])
+                        activations[idx] = F.linear(hidden, experts.down_proj[idx]).cpu()
                 else:
                     # Llama4-style: batched fused experts with nn.Linear router
                     if hasattr(module, "router"):
@@ -460,10 +464,18 @@ class MoETransformerObserver(BaseTransformerObserver):
                     )  # (num_experts, total_seq_len, hidden_dim)
 
             del flat_input
-            
+
+            # When activations are on CPU (e.g., Qwen3.5 with 256 experts),
+            # move all computation tensors to CPU to avoid cross-device errors.
+            if activations.device.type == "cpu":
+                router_logits = router_logits.cpu()
+                selected_experts = selected_experts.cpu()
+                device = torch.device("cpu")
+
             # Filter out padding tokens if attention mask is provided
             if flat_mask is not None:
                 num_tokens = flat_mask.sum().item()
+                flat_mask = flat_mask.to(device)
                 # Filter selected_experts: (total_tokens, top_k) -> (num_valid_tokens, top_k)
                 selected_experts = selected_experts[flat_mask]
                 # Filter activations: (num_experts, total_tokens, hidden_dim) -> (num_experts, num_valid_tokens, hidden_dim)

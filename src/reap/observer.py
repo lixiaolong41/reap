@@ -409,17 +409,35 @@ class MoETransformerObserver(BaseTransformerObserver):
                     _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                     selected_experts = selected_experts.to(device)
 
-                    # Allocate activations on CPU to avoid GPU OOM with large expert
-                    # counts (e.g., 256 experts). Each expert's output is computed on GPU
-                    # then immediately moved to CPU.
+                    # Batched expert computation: process multiple experts at once
+                    # using bmm instead of per-expert F.linear to reduce kernel launch
+                    # overhead. Results stored on CPU to avoid GPU OOM.
                     activations = torch.zeros((num_experts, *flat_input.shape), device="cpu")
                     experts = module.experts
                     act_fn = experts.act_fn
-                    for idx in range(num_experts):
-                        gate_up = F.linear(flat_input, experts.gate_up_proj[idx])
+                    expert_batch = 32  # experts per batch, ~1.3GB GPU peak for seq_len=2048
+                    flat_input_1 = flat_input.unsqueeze(0)  # (1, seq_len, hidden)
+                    for start in range(0, num_experts, expert_batch):
+                        end = min(start + expert_batch, num_experts)
+                        # gate_up_proj slice: (B, 2*inter, hidden)
+                        # bmm: (B, seq, hidden) @ (B, hidden, 2*inter) -> (B, seq, 2*inter)
+                        B = end - start
+                        gate_up = torch.bmm(
+                            flat_input_1.expand(B, -1, -1),
+                            experts.gate_up_proj[start:end].transpose(1, 2),
+                        )
                         gate, up = gate_up.chunk(2, dim=-1)
                         hidden = act_fn(gate) * up
-                        activations[idx] = F.linear(hidden, experts.down_proj[idx]).cpu()
+                        del gate_up, gate, up
+                        # down_proj slice: (B, hidden, inter)
+                        # bmm: (B, seq, inter) @ (B, inter, hidden) -> (B, seq, hidden)
+                        out = torch.bmm(
+                            hidden,
+                            experts.down_proj[start:end].transpose(1, 2),
+                        )
+                        del hidden
+                        activations[start:end] = out.cpu()
+                        del out
                 else:
                     # Llama4-style: batched fused experts with nn.Linear router
                     if hasattr(module, "router"):

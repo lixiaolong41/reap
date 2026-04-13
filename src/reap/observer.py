@@ -397,8 +397,6 @@ class MoETransformerObserver(BaseTransformerObserver):
                 # No mask provided - treat all tokens as valid
                 flat_mask = None
 
-            activations = torch.zeros((num_experts, *flat_input.shape), device=device)
-
             if self.hook_config.fused_experts:
                 fused_type = getattr(self.hook_config, "fused_expert_type", "batched")
 
@@ -411,7 +409,7 @@ class MoETransformerObserver(BaseTransformerObserver):
                     _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                     selected_experts = selected_experts.to(device)
 
-                    # Re-allocate activations on CPU to avoid GPU OOM with large expert
+                    # Allocate activations on CPU to avoid GPU OOM with large expert
                     # counts (e.g., 256 experts). Each expert's output is computed on GPU
                     # then immediately moved to CPU.
                     activations = torch.zeros((num_experts, *flat_input.shape), device="cpu")
@@ -458,6 +456,7 @@ class MoETransformerObserver(BaseTransformerObserver):
                 *_, router_logits = output  # (total_tokens, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                 # selected_experts = selected_experts.to(device)
+                activations = torch.zeros((num_experts, *flat_input.shape), device=device)
                 for idx, expert in enumerate(module.experts):
                     activations[idx] = expert(flat_input).to(
                         device

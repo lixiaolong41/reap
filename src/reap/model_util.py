@@ -115,12 +115,78 @@ MODEL_ATTRS = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    "Qwen3_5MoeForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
+    "Qwen3_5MoeForConditionalGeneration": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
 }
 
 
+def _get_layers(model):
+    """Get decoder layers, handling multimodal models with different layer paths."""
+    if model.__class__.__name__ == "Qwen3_5MoeForConditionalGeneration":
+        return model.model.language_model.layers
+    return model.model.layers
+
+
+def _get_moe_config(model):
+    """Get the config object containing MoE parameters (handles nested text_config)."""
+    if hasattr(model.config, "text_config"):
+        return model.config.text_config
+    return model.config
+
+
+def load_model(model_name, **kwargs):
+    """Load a model using the appropriate Auto class based on architecture.
+
+    For standard causal LM models, uses AutoModelForCausalLM.
+    For multimodal/conditional generation models (e.g., Qwen3_5MoeForConditionalGeneration),
+    uses AutoModelForImageTextToText.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(
+        model_name,
+        trust_remote_code=kwargs.get("trust_remote_code", True),
+        local_files_only=kwargs.get("local_files_only", False),
+    )
+    architectures = getattr(config, "architectures", [])
+
+    if any("ConditionalGeneration" in arch for arch in architectures):
+        from transformers import AutoModelForImageTextToText
+
+        logger.info(
+            f"Detected ConditionalGeneration architecture {architectures}, "
+            f"using AutoModelForImageTextToText."
+        )
+        return AutoModelForImageTextToText.from_pretrained(model_name, **kwargs)
+
+    return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+
+
 def get_moe(model, layer):
-    moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
-    return getattr(model.model.layers[layer], moe_attr_name)
+    attrs = MODEL_ATTRS.get(model.__class__.__name__)
+    moe_attr_name = attrs["moe_block"]
+    layers = _get_layers(model)
+    return getattr(layers[layer], moe_attr_name)
 
 
 def assert_merge(model, merged_moe, cluster_label):

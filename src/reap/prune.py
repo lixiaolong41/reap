@@ -10,7 +10,7 @@ import yaml
 
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from transformers import AutoTokenizer, HfArgumentParser
 
 from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
@@ -32,7 +32,7 @@ from reap.cluster import (
     hierarchical_clustering,
     dynamic_frequency_penalized_clustering,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices, _get_moe_config, load_model
 from reap.eval import run_evaluate
 import shutil
 
@@ -174,21 +174,47 @@ def prune(
                 )
             setattr(moe, model_attrs["router"], router)
         else:
-            # prune fused experts, only tested for llama-4
-            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
-                retained_expert_indicies
-            ]
-            moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
-            moe.num_experts = len(retained_expert_indicies)
-            moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
-            moe.router.out_features = len(retained_expert_indicies)
-            if hasattr(moe.router, "num_experts"):  # transformers >= 4.54+
-                moe.router.num_experts = len(retained_expert_indicies)
+            # prune fused experts (Llama4, Qwen3.5, etc.)
+            experts = getattr(moe, model_attrs["experts"])
+            router = getattr(moe, model_attrs["router"])
+
+            # prune expert parameters
+            if hasattr(experts, "gate_up_proj") and isinstance(
+                experts.gate_up_proj, torch.nn.Parameter
+            ):
+                # Qwen3.5-style: gate_up_proj and down_proj are nn.Parameter
+                experts.gate_up_proj = torch.nn.Parameter(
+                    experts.gate_up_proj.data[retained_expert_indicies]
+                )
+                experts.down_proj = torch.nn.Parameter(
+                    experts.down_proj.data[retained_expert_indicies]
+                )
+                if hasattr(experts, "num_experts"):
+                    experts.num_experts = len(retained_expert_indicies)
+            else:
+                # Llama4-style: direct tensor indexing
+                moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
+                    retained_expert_indicies
+                ]
+                moe.experts.down_proj.data = moe.experts.down_proj[
+                    retained_expert_indicies
+                ]
+                moe.num_experts = len(retained_expert_indicies)
+
+            # prune router weights
+            router.weight = torch.nn.Parameter(
+                router.weight.data[retained_expert_indicies]
+            )
+            if hasattr(router, "out_features"):
+                router.out_features = len(retained_expert_indicies)
+            if hasattr(router, "num_experts"):
+                router.num_experts = len(retained_expert_indicies)
 
     # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
-    setattr(model.config, model_attrs["num_experts"], retained_experts)
+    moe_config = _get_moe_config(model)
+    setattr(moe_config, model_attrs["num_experts"], retained_experts)
     if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
         model.config.moe_capacity = [
             retained_experts,
@@ -250,7 +276,7 @@ def main():
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     # load model
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_model(
         model_name,
         device_map="auto",
         torch_dtype="auto",

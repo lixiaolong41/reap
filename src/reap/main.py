@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from transformers import AutoTokenizer, HfArgumentParser
 
 from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
@@ -51,6 +51,8 @@ from reap.model_util import (
     MODEL_ATTRS,
     patched_model_map,
     get_super_expert_indices,
+    _get_moe_config,
+    load_model,
 )
 from reap.eval import run_evaluate
 from reap.cluster_plots import plot_cluster_analysis
@@ -118,8 +120,9 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
 def _setup_observer(model, obs_args):
     """Create and return an MoETransformerObserver for the given model."""
     try:
+        moe_config = _get_moe_config(model)
         renormalize_router_weights = (
-            getattr(model.config, "norm_topk_prob", False)
+            getattr(moe_config, "norm_topk_prob", False)
             and obs_args.renormalize_router_weights
         )
         if renormalize_router_weights:
@@ -668,7 +671,7 @@ def main():
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     # load model
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_model(
         model_name,
         device_map="auto",
         torch_dtype="auto",

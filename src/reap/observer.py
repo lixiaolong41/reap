@@ -220,6 +220,7 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
     num_experts_attr_name: str = "num_experts"
     top_k_attr_name: str = "top_k"
     fused_experts: bool = False
+    fused_expert_type: str = "batched"  # "batched" (Llama4) or "parameter" (Qwen3.5)
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False
     record_pruning_metrics_only: bool = False
@@ -268,11 +269,16 @@ class MoETransformerObserver(BaseTransformerObserver):
             for layer_num, layer_state in self.state.items()
         }
 
-    def _initialize_state(self, output: torch.Tensor, num_experts: int):
+    def _initialize_state(self, output, num_experts: int):
         # get device and shape info
-        output_hidden_states = output[0]
+        if isinstance(output, torch.Tensor):
+            # Single tensor output (e.g., Qwen3.5 SparseMoeBlock)
+            hidden_dim = output.shape[-1]
+        else:
+            # Tuple output (e.g., Llama4, Qwen3, Mixtral, etc.)
+            output_hidden_states = output[0]
+            hidden_dim = output_hidden_states.shape[-1]
         device = "cpu"
-        hidden_dim = output_hidden_states.shape[-1]
         layer_state = {}
 
         # unnormalized states (counts)
@@ -367,10 +373,14 @@ class MoETransformerObserver(BaseTransformerObserver):
 
         @torch.no_grad()
         def _hook_fn(module, args, output):
-            if not len(output) >= 2:
+            # Qwen3.5 fused experts return a single tensor, not a tuple
+            if self.hook_config.fused_experts and isinstance(output, torch.Tensor):
+                pass  # Single-tensor output is valid for fused expert models like Qwen3.5
+            elif not (isinstance(output, (tuple, list)) and len(output) >= 2):
                 raise ValueError(
                     f"Expected output of module {module.__class__.__name__} at layer "
-                    f"{layer_number} to be a tuple of at least length 2, got {len(output)}."
+                    f"{layer_number} to be a tuple of at least length 2, got "
+                    f"{type(output).__name__}."
                 )
             input = args[0]  # (batch_size, seq_len, hidden_dim)
             device = input.device
@@ -390,25 +400,54 @@ class MoETransformerObserver(BaseTransformerObserver):
             activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
             if self.hook_config.fused_experts:
-                _, router_scores = output  # (num_experts, total_tokens)
-                router_logits = module.router(flat_input)  # (total_tokens, num_experts)
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                selected_experts = selected_experts.to(device)
-                router_indices = (
-                    torch.arange(batch_size * sequence_length, device=device)
-                    .view(1, -1)
-                    .expand(router_scores.size(0), -1)
-                )
-                router_indices = router_indices.reshape(-1, 1).expand(-1, hidden_dim)
-                routed_in = torch.gather(
-                    input=flat_input,
-                    dim=0,
-                    index=router_indices,
-                ).to(device)
-                # we do not apply router_scores
-                # record unweighted activations for all experts
-                routed_out = module.experts(routed_in)
-                activations = routed_out.view(num_experts, *flat_input.shape)
+                fused_type = getattr(self.hook_config, "fused_expert_type", "batched")
+
+                if fused_type == "parameter":
+                    # Qwen3.5-style: nn.Parameter-based fused experts with custom TopKRouter
+                    router = module.gate
+                    # Compute raw logits from router weight (TopKRouter applies softmax internally)
+                    router_logits = F.linear(flat_input, router.weight)
+
+                    _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                    selected_experts = selected_experts.to(device)
+
+                    experts = module.experts
+                    act_fn = experts.act_fn
+                    for idx in range(num_experts):
+                        gate_up = F.linear(flat_input, experts.gate_up_proj[idx])
+                        gate, up = gate_up.chunk(2, dim=-1)
+                        hidden = act_fn(gate) * up
+                        activations[idx] = F.linear(hidden, experts.down_proj[idx])
+                else:
+                    # Llama4-style: batched fused experts with nn.Linear router
+                    if hasattr(module, "router"):
+                        router_logits = module.router(flat_input)
+                    elif hasattr(module, "gate"):
+                        router_logits = module.gate(flat_input)
+                    else:
+                        raise ValueError(
+                            f"Fused MoE module {module.__class__.__name__} has neither 'gate' nor 'router' attribute."
+                        )
+
+                    _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                    selected_experts = selected_experts.to(device)
+
+                    _, router_scores = output  # (num_experts, total_tokens)
+                    router_indices = (
+                        torch.arange(batch_size * sequence_length, device=device)
+                        .view(1, -1)
+                        .expand(router_scores.size(0), -1)
+                    )
+                    router_indices = router_indices.reshape(-1, 1).expand(-1, hidden_dim)
+                    routed_in = torch.gather(
+                        input=flat_input,
+                        dim=0,
+                        index=router_indices,
+                    ).to(device)
+                    # we do not apply router_scores
+                    # record unweighted activations for all experts
+                    routed_out = module.experts(routed_in)
+                    activations = routed_out.view(num_experts, *flat_input.shape)
 
             else:  # loop based MoE execution
                 # ernie returns combined_output, combine_weights, router_loss, gate_logits
@@ -663,6 +702,15 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
     fused_experts: bool = False
 
 
+@dataclass
+class Qwen3_5MoEObserverHookConfig(MoETransformerObserverConfig):
+    module_class_name_to_hook_regex: Optional[str] = "Qwen3_5MoeSparseMoeBlock"
+    num_experts_attr_name: str = "gate.num_experts"
+    top_k_attr_name: str = "gate.top_k"
+    fused_experts: bool = True
+    fused_expert_type: str = "parameter"
+
+
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
@@ -672,4 +720,6 @@ OBSERVER_CONFIG_REGISTRY = {
     "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
+    "Qwen3_5MoeForCausalLM": Qwen3_5MoEObserverHookConfig,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoEObserverHookConfig,
 }

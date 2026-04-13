@@ -37,6 +37,7 @@ def get_original_model_name(model_name: str) -> Tuple[str, bool]:
         "gpt-oss-120b": "openai/gpt-oss-120b",
         "GLM-4.5-Air": "zai-org/GLM-4.5-Air",
         "Qwen3-Coder-480B-A35B-Instruct-FP8": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        "Qwen3.5-35B-A3B": "Qwen/Qwen3.5-35B-A3B",
     }
 
     original_model = None

@@ -403,33 +403,226 @@ class MoETransformerObserver(BaseTransformerObserver):
                 if fused_type == "parameter":
                     # Qwen3.5-style: nn.Parameter-based fused experts with custom TopKRouter
                     router = module.gate
-                    # Compute raw logits from router weight (TopKRouter applies softmax internally)
                     router_logits = F.linear(flat_input, router.weight)
-
                     _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                     selected_experts = selected_experts.to(device)
 
-                    # Batched expert computation: process experts in GPU batches,
-                    # then transfer entire batch to CPU at once. This reduces
-                    # GPU-CPU synchronization from 256 to 8 per layer.
-                    activations = torch.zeros((num_experts, *flat_input.shape), device="cpu")
-                    experts = module.experts
-                    act_fn = experts.act_fn
-                    expert_batch = 32
-                    for start in range(0, num_experts, expert_batch):
-                        end = min(start + expert_batch, num_experts)
-                        B = end - start
-                        batch_buf = torch.empty(
-                            (B, *flat_input.shape), device=device, dtype=flat_input.dtype
+                    # Filter padding tokens early so expert computation only
+                    # runs on valid tokens, saving compute and memory.
+                    if flat_mask is not None:
+                        num_tokens = flat_mask.sum().item()
+                        flat_mask = flat_mask.to(device)
+                        flat_input = flat_input[flat_mask]
+                        selected_experts = selected_experts[flat_mask]
+                        router_logits = router_logits[flat_mask]
+                    else:
+                        num_tokens = batch_size * sequence_length
+                    num_tokens = torch.tensor(num_tokens, device="cpu", dtype=torch.long)
+
+                    # Frequency metrics (no activations needed)
+                    expert_frequency = torch.bincount(
+                        selected_experts.view(-1), minlength=num_experts
+                    ).to(device)
+                    pairwise_expert_frequency = (
+                        expert_frequency.unsqueeze(0) + expert_frequency.unsqueeze(1)
+                    ).to(device)
+
+                    self.state[layer_number]["total_tokens"] += num_tokens
+                    self.state[layer_number]["expert_frequency"] += expert_frequency.to(
+                        "cpu", torch.long
+                    )
+                    self.state[layer_number][
+                        "pairwise_expert_frequency"
+                    ] += pairwise_expert_frequency.to("cpu", torch.long)
+
+                    if not self.hook_config.record_pruning_metrics_only:
+                        # Merging mode: need full activations tensor (slow path)
+                        activations = torch.zeros(
+                            (num_experts, flat_input.shape[0], hidden_dim),
+                            device="cpu",
                         )
-                        for i in range(B):
-                            idx = start + i
-                            gate_up = F.linear(flat_input, experts.gate_up_proj[idx])
+                        experts_mod = module.experts
+                        act_fn_slow = experts_mod.act_fn
+                        expert_batch = 32
+                        for start in range(0, num_experts, expert_batch):
+                            end = min(start + expert_batch, num_experts)
+                            B = end - start
+                            batch_buf = torch.empty(
+                                (B, flat_input.shape[0], hidden_dim),
+                                device=device,
+                                dtype=flat_input.dtype,
+                            )
+                            for i in range(B):
+                                idx = start + i
+                                gu = F.linear(flat_input, experts_mod.gate_up_proj[idx])
+                                g, u = gu.chunk(2, dim=-1)
+                                h = act_fn_slow(g) * u
+                                batch_buf[i] = F.linear(h, experts_mod.down_proj[idx])
+                            activations[start:end] = batch_buf.cpu()
+                            del batch_buf
+
+                        # Fall through to merging + pruning criteria below
+                        del flat_input
+                        # Move to CPU for merging metrics
+                        router_logits = router_logits.cpu()
+                        selected_experts = selected_experts.cpu()
+                        device = torch.device("cpu")
+                        # Jump to merging criteria (skip the common flat_mask / freq section)
+                        # -- merging criteria --
+                        ttm_similarity_matrix = ttm_online(
+                            activations,
+                            selected_experts,
+                            distance_callable=distance_fn,
+                            num_experts=num_experts,
+                            pairwise_expert_frequency=pairwise_expert_frequency.to(device),
+                        )
+                        self.state[layer_number]["ttm_similarity_matrix"].update(
+                            ttm_similarity_matrix, pairwise_expert_frequency.to(device)
+                        )
+                        del ttm_similarity_matrix
+
+                        routed_characteristic_activation = get_routed_characteristic_activation(
+                            activations, selected_experts, expert_frequency.to(device),
+                            device, hidden_dim, num_experts,
+                        )
+                        expert_freq_expanded = expert_frequency.to(device).unsqueeze(-1).expand((-1, hidden_dim))
+                        self.state[layer_number]["routed_characteristic_activation"].update(
+                            routed_characteristic_activation, expert_freq_expanded
+                        )
+                        del expert_freq_expanded, routed_characteristic_activation
+
+                        online_characteristic_activation_dist = ca_dist_online(
+                            activations, distance_callable=distance_fn,
+                        ).to(device="cpu")
+                        self.state[layer_number]["online_characteristic_activation_dist"].update(
+                            online_characteristic_activation_dist, num_tokens
+                        )
+                        del online_characteristic_activation_dist
+
+                        self.state[layer_number]["characteristic_activation"].update(
+                            activations.mean(dim=1), num_tokens
+                        )
+
+                        router_logit_sim = (
+                            distance_fn(
+                                router_logits.permute(1, 0).view(1, num_experts, 1, -1),
+                                router_logits.permute(1, 0).view(1, 1, num_experts, -1),
+                            )
+                            .squeeze(0)
+                            .to(device="cpu")
+                        )
+                        self.state[layer_number]["router_logit_similiarity"].update(
+                            router_logit_sim, num_tokens
+                        )
+                        del router_logit_sim
+
+                    # Pruning criteria: compute per-expert metrics on GPU inline
+                    routing_weights = F.softmax(
+                        router_logits, dim=1, dtype=torch.float
+                    ).to(device)
+                    if self.hook_config.renormalize_router_weights:
+                        topk_weights = torch.gather(
+                            routing_weights, 1, selected_experts
+                        )
+                        routing_weights = routing_weights / topk_weights.sum(
+                            dim=-1, keepdim=True
+                        )
+                        routing_weights = torch.clamp(
+                            routing_weights,
+                            min=torch.finfo(routing_weights.dtype).eps,
+                        )
+
+                    ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+                    ean_mean = torch.zeros(num_experts, device=device, dtype=torch.float32)
+                    weighted_ean_sum = torch.zeros(
+                        num_experts, device=device, dtype=torch.float64
+                    )
+                    reap_vals = torch.zeros(num_experts, device=device, dtype=torch.float32)
+                    weighted_expert_frequency_sum = torch.zeros(
+                        num_experts, device=device, dtype=torch.float64
+                    )
+                    prior_max_activations = self.state[layer_number]["max_activations"]
+
+                    if self.hook_config.record_pruning_metrics_only:
+                        # FAST PATH: compute activation + metrics per expert on GPU,
+                        # never allocate full (num_experts, seq, hidden) tensor.
+                        experts_mod = module.experts
+                        act_fn = experts_mod.act_fn
+                        for idx in range(num_experts):
+                            gate_up = F.linear(flat_input, experts_mod.gate_up_proj[idx])
                             gate, up = gate_up.chunk(2, dim=-1)
-                            hidden = act_fn(gate) * up
-                            batch_buf[i] = F.linear(hidden, experts.down_proj[idx])
-                        activations[start:end] = batch_buf.cpu()
-                        del batch_buf
+                            h = act_fn(gate) * up
+                            activation = F.linear(h, experts_mod.down_proj[idx])
+                            del gate_up, gate, up, h
+
+                            active_mask = (selected_experts == idx).any(dim=-1)
+                            if active_mask.any():
+                                active_rw = routing_weights[active_mask, idx]
+                                ean_norm = torch.linalg.norm(
+                                    activation[active_mask], dim=-1
+                                )
+                                ean_sum[idx] = ean_norm.sum()
+                                ean_mean[idx] = ean_norm.mean()
+                                weighted_expert_frequency_sum[idx] = active_rw.sum()
+                                weighted_ean_sum[idx] = (ean_norm * active_rw).sum()
+                                reap_vals[idx] = (ean_norm * active_rw).mean()
+                                act_max = activation[active_mask].max().cpu()
+                                if act_max > prior_max_activations[idx]:
+                                    self.state[layer_number]["max_activations"][
+                                        idx
+                                    ] = act_max
+                                    prior_max_activations[idx] = act_max
+                            del activation
+                        del flat_input
+                    else:
+                        # SLOW PATH: activations already computed above, use them
+                        for idx in range(num_experts):
+                            active_mask = (selected_experts == idx).any(dim=-1).to(device)
+                            if not active_mask.any():
+                                continue
+                            active_rw = routing_weights[active_mask, idx]
+                            ean_norm = torch.linalg.norm(
+                                activations[idx, active_mask, :], dim=-1
+                            )
+                            ean_sum[idx] = ean_norm.sum().to(device)
+                            ean_mean[idx] = ean_norm.mean().to(device)
+                            weighted_expert_frequency_sum[idx] = active_rw.sum().to(device)
+                            weighted_ean_sum[idx] = (ean_norm * active_rw).sum().to(device)
+                            reap_vals[idx] = (ean_norm * active_rw).mean().to(device)
+                            selected_activations = activations[idx, active_mask, :]
+                            act_max = selected_activations.max().to(device="cpu")
+                            if act_max > prior_max_activations[idx]:
+                                self.state[layer_number]["max_activations"][idx] = act_max
+                                prior_max_activations[idx] = act_max
+                        del flat_input, activations
+
+                    self.state[layer_number]["ean_sum"] += ean_sum.to(device="cpu")
+                    self.state[layer_number]["ean_mean"].update(ean_mean, expert_frequency)
+                    self.state[layer_number]["weighted_ean_sum"] += weighted_ean_sum.to(
+                        device="cpu"
+                    )
+                    if reap_vals.sum() == 0:
+                        print("debug")
+                    self.state[layer_number]["reap"].update(reap_vals, expert_frequency)
+                    self.state[layer_number][
+                        "weighted_expert_frequency_sum"
+                    ] += weighted_expert_frequency_sum.to(device="cpu")
+
+                    del (
+                        selected_experts,
+                        router_logits,
+                        expert_frequency,
+                        pairwise_expert_frequency,
+                        prior_max_activations,
+                        routing_weights,
+                        ean_sum,
+                        ean_mean,
+                        weighted_ean_sum,
+                        reap_vals,
+                        weighted_expert_frequency_sum,
+                    )
+                    gc.collect()
+                    return  # All metrics computed; skip the common path below
                 else:
                     # Llama4-style: batched fused experts with nn.Linear router
                     if hasattr(module, "router"):

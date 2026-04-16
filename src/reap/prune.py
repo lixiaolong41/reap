@@ -305,6 +305,19 @@ def main():
 
     # pruning
     logger.info("Start of pruning")
+
+    # Remove accelerate dispatch hooks and move model to CPU before pruning.
+    # With device_map="auto", accelerate offloads some layers to CPU/disk and
+    # manages them via hooks that hold references to the original parameters.
+    # When we reassign nn.Parameter during pruning, the hooks still reference
+    # the old tensors, causing save_pretrained to serialize stale weights for
+    # offloaded layers. Moving everything to CPU ensures parameter replacement
+    # is visible to save_pretrained.
+    remove_hook_from_module(model, recurse=True)
+    model = model.to("cpu")
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Model moved to CPU and accelerate hooks removed for pruning.")
     n_experts_to_prune = prune_args.n_experts_to_prune
     if n_experts_to_prune is None:
         if cluster_args.compression_ratio is None:
@@ -356,6 +369,20 @@ def main():
                 pass
 
         tokenizer.save_pretrained(pruned_model_dir)
+
+        # Copy extra files needed for multimodal models (e.g., Qwen3.5)
+        # that are not saved by model.save_pretrained() or tokenizer.save_pretrained()
+        extra_files = [
+            "preprocessor_config.json",
+            "video_preprocessor_config.json",
+        ]
+        source_dir = pathlib.Path(model_name)
+        for fname in extra_files:
+            source_file = source_dir / fname
+            if source_file.exists():
+                shutil.copy2(source_file, pruned_model_dir / fname)
+                logger.info(f"Copied {fname} to {pruned_model_dir}")
+
         if model_name == "artifacts/models/GLM-4.5-Air":
             # move modelling file
             source_file = pathlib.Path(model_name) / "modeling_glm4_moe.py"

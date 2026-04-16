@@ -224,7 +224,7 @@ def prune(
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    model.save_pretrained(pruned_model_dir)
+    model.save_pretrained(pruned_model_dir, max_shard_size="5GB")
     end = time.time()
     logger.info(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
@@ -306,18 +306,17 @@ def main():
     # pruning
     logger.info("Start of pruning")
 
-    # Remove accelerate dispatch hooks and move model to CPU before pruning.
+    # Remove accelerate dispatch hooks before pruning.
     # With device_map="auto", accelerate offloads some layers to CPU/disk and
     # manages them via hooks that hold references to the original parameters.
     # When we reassign nn.Parameter during pruning, the hooks still reference
     # the old tensors, causing save_pretrained to serialize stale weights for
-    # offloaded layers. Moving everything to CPU ensures parameter replacement
-    # is visible to save_pretrained.
+    # offloaded layers. Removing hooks makes parameter replacement visible.
+    # NOTE: We do NOT call model.to("cpu") here because 60GB RAM cannot hold
+    # the full model (~47GB) + save_pretrained's state_dict copy (~47GB).
+    # Instead we keep the mixed GPU/CPU device placement and save with sharding.
     remove_hook_from_module(model, recurse=True)
-    model = model.to("cpu")
-    torch.cuda.empty_cache()
-    gc.collect()
-    logger.info("Model moved to CPU and accelerate hooks removed for pruning.")
+    logger.info("Accelerate hooks removed for pruning.")
     n_experts_to_prune = prune_args.n_experts_to_prune
     if n_experts_to_prune is None:
         if cluster_args.compression_ratio is None:
